@@ -61,16 +61,17 @@ std::wstring Utf8ToWide(const std::string& utf8Str) {
     return wstr;
 }
 
-void FcNativeVideoThumbnailPlugin::RegisterWithRegistrar(flutter::PluginRegistrarWindows *registrar) {
+void FcNativeVideoThumbnailPlugin::RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar) {
     auto channel = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
-        registrar->messenger(), "fc_native_video_thumbnail",
-        &flutter::Standard_method_codec::GetInstance());
+        registrar->messenger(),
+        "fc_native_video_thumbnail",
+        &flutter::StandardMethodCodec::GetInstance()); // 必须是大驼峰：StandardMethodCodec
 
     auto plugin = std::make_unique<FcNativeVideoThumbnailPlugin>();
 
-    channel->SetMethodCallHandler([plugin_pointer = plugin.get()](const auto &call, auto result) {
+    channel->SetMethodCallHandler([plugin_pointer = plugin.get()](const auto& call, auto result) {
         plugin_pointer->HandleMethodCall(call, std::move(result));
-    });
+        });
 
     registrar->AddPlugin(std::move(plugin));
 }
