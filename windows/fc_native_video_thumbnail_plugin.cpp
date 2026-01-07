@@ -1,4 +1,4 @@
-#include "fc_native_video_thumbnail_plugin.h"
+﻿#include "fc_native_video_thumbnail_plugin.h"
 
 #include <flutter/method_channel.h>
 #include <flutter/plugin_registrar_windows.h>
