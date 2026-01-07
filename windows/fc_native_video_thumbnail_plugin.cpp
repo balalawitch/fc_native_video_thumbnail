@@ -1,154 +1,48 @@
 #include "fc_native_video_thumbnail_plugin.h"
 
-// This must be included before many other Windows headers.
-#include <atlimage.h>
-#include <comdef.h>
 #include <flutter/method_channel.h>
 #include <flutter/plugin_registrar_windows.h>
 #include <flutter/standard_method_codec.h>
-#include <gdiplus.h>
-#include <gdiplusimaging.h>
-#include <shlwapi.h>
-#include <thumbcache.h>
-#include <wincodec.h>
-#include <windows.h>
-#include <wingdi.h>
 
-#include <codecvt>
-#include <iostream>
-#include <locale>
 #include <memory>
-#include <sstream>
 #include <string>
+#include <vector>
+#include <fstream>
+#include <windows.h>
 
-const std::string kGetThumbnailFailedExtraction = "Failed extraction";
+// WinRT 核心头文件
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Storage.h>
+#include <winrt/Windows.Storage.FileProperties.h>
+#include <winrt/Windows.Storage.Streams.h>
+
+using namespace winrt;
+using namespace Windows::Storage;
+using namespace Windows::Storage::FileProperties;
+using namespace Windows::Storage::Streams;
 
 namespace fc_native_video_thumbnail {
 
-// https://github.com/flutter/plugins/blob/main/packages/camera/camera_windows/windows/camera_plugin.cpp
-// Looks for |key| in |map|, returning the associated value if it is present, or
-// a nullptr if not.
-const flutter::EncodableValue* ValueOrNull(const flutter::EncodableMap& map, const char* key) {
-  auto it = map.find(flutter::EncodableValue(key));
-  if (it == map.end()) {
-    return nullptr;
-  }
-  return &(it->second);
+// 辅助函数：将 Flutter 传来的 UTF-8 字符串转换为 Windows 宽字符 (解决中文路径问题)
+std::wstring Utf8ToWide(const std::string& utf8Str) {
+    if (utf8Str.empty()) return L"";
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &utf8Str[0], (int)utf8Str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &utf8Str[0], (int)utf8Str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
 }
 
-// Looks for |key| in |map|, returning the associated int64 value if it is
-// present, or std::nullopt if not.
-std::optional<int64_t> GetInt64ValueOrNull(const flutter::EncodableMap& map,
-                                           const char* key) {
-  auto value = ValueOrNull(map, key);
-  if (!value) {
-    return std::nullopt;
-  }
-
-  if (std::holds_alternative<int32_t>(*value)) {
-    return static_cast<int64_t>(std::get<int32_t>(*value));
-  }
-  auto val64 = std::get_if<int64_t>(value);
-  if (!val64) {
-    return std::nullopt;
-  }
-  return *val64;
-}
-
-// Converts the given UTF-8 string to UTF-16.
-std::wstring Utf16FromUtf8(const std::string& utf8_string) {
-  if (utf8_string.empty()) {
-    return std::wstring();
-  }
-  int target_length =
-      ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_string.data(),
-                            static_cast<int>(utf8_string.length()), nullptr, 0);
-  if (target_length == 0) {
-    return std::wstring();
-  }
-  std::wstring utf16_string;
-  utf16_string.resize(target_length);
-  int converted_length =
-      ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_string.data(),
-                            static_cast<int>(utf8_string.length()),
-                            utf16_string.data(), target_length);
-  if (converted_length == 0) {
-    return std::wstring();
-  }
-  return utf16_string;
-}
-
-std::string HRESULTToString(HRESULT hr) {
-  _com_error error(hr);
-  CString cs;
-  cs.Format(_T("Error 0x%08x: %s"), hr, error.ErrorMessage());
-
-  std::string res;
-
-#ifdef UNICODE
-  int wlen = lstrlenW(cs);
-  int len = WideCharToMultiByte(CP_ACP, 0, cs, wlen, NULL, 0, NULL, NULL);
-  res.resize(len);
-  WideCharToMultiByte(CP_ACP, 0, cs, wlen, &res[0], len, NULL, NULL);
-#else
-  res = errMsg;
-#endif
-  return res;
-}
-
-std::string SaveThumbnail(PCWSTR srcFile, PCWSTR destFile, int size, REFGUID type) {
-  IShellItem* pSI;
-  HRESULT hr = SHCreateItemFromParsingName(srcFile, NULL, IID_IShellItem, (void**)&pSI);
-  if (!SUCCEEDED(hr)) {
-    return "`SHCreateItemFromParsingName` failed with " + HRESULTToString(hr);
-  }
-
-  IThumbnailCache* pThumbCache;
-  hr = CoCreateInstance(CLSID_LocalThumbnailCache,
-                        NULL,
-                        CLSCTX_INPROC_SERVER,
-                        IID_PPV_ARGS(&pThumbCache));
-
-  if (!SUCCEEDED(hr)) {
-    return "`CoCreateInstance` failed with " + HRESULTToString(hr);
-  }
-  ISharedBitmap* pSharedBitmap = NULL;
-  hr = pThumbCache->GetThumbnail(pSI,
-                                 size,
-                                 WTS_EXTRACT | WTS_SCALETOREQUESTEDSIZE,
-                                 &pSharedBitmap,
-                                 NULL,
-                                 NULL);
-
-  if (!SUCCEEDED(hr) || !pSharedBitmap) {
-    pThumbCache->Release();
-    if (hr == WTS_E_FAILEDEXTRACTION) {
-      return kGetThumbnailFailedExtraction;
+// 辅助函数：将 WinRT 流保存到本地文件
+void SaveBufferToFile(IBuffer const& buffer, std::wstring const& filePath) {
+    std::ofstream file(filePath, std::ios::binary);
+    if (file.is_open()) {
+        file.write(reinterpret_cast<const char*>(buffer.data()), buffer.Length());
+        file.close();
     }
-    return "`GetThumbnail` failed with " + HRESULTToString(hr);
-  }
-  HBITMAP hBitmap;
-  hr = pSharedBitmap->GetSharedBitmap(&hBitmap);
-  if (!SUCCEEDED(hr) || !hBitmap) {
-    pThumbCache->Release();
-    return "`GetSharedBitmap` failed with " + HRESULTToString(hr);
-  }
-
-  pThumbCache->Release();
-
-  // Save the bitmap to a file
-  CImage image;
-  image.Attach(hBitmap);
-  hr = image.Save(destFile, type);
-  if (!SUCCEEDED(hr)) {
-    return "`image.Attach` failed with " + HRESULTToString(hr);
-  }
-  return "";
 }
 
-// static
 void FcNativeVideoThumbnailPlugin::RegisterWithRegistrar(
-    flutter::PluginRegistrarWindows* registrar) {
+    flutter::PluginRegistrarWindows *registrar) {
   auto channel =
       std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
           registrar->messenger(), "fc_native_video_thumbnail",
@@ -157,51 +51,70 @@ void FcNativeVideoThumbnailPlugin::RegisterWithRegistrar(
   auto plugin = std::make_unique<FcNativeVideoThumbnailPlugin>();
 
   channel->SetMethodCallHandler(
-      [plugin_pointer = plugin.get()](const auto& call, auto result) {
+      [plugin_pointer = plugin.get()](const auto &call, auto result) {
         plugin_pointer->HandleMethodCall(call, std::move(result));
       });
 
   registrar->AddPlugin(std::move(plugin));
 }
 
-FcNativeVideoThumbnailPlugin::FcNativeVideoThumbnailPlugin() {}
+FcNativeVideoThumbnailPlugin::FcNativeVideoThumbnailPlugin() {
+    // 初始化 WinRT 线程环境
+    try {
+        init_apartment(); 
+    } catch (...) {}
+}
 
 FcNativeVideoThumbnailPlugin::~FcNativeVideoThumbnailPlugin() {}
 
 void FcNativeVideoThumbnailPlugin::HandleMethodCall(
-    const flutter::MethodCall<flutter::EncodableValue>& method_call,
+    const flutter::MethodCall<flutter::EncodableValue> &method_call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  const auto* argsPtr = std::get_if<flutter::EncodableMap>(method_call.arguments());
-  assert(argsPtr);
-  auto args = *argsPtr;
+  
   if (method_call.method_name().compare("getVideoThumbnail") == 0) {
-    // Required arguments are enforced on dart side.
-    const auto* src_file =
-        std::get_if<std::string>(ValueOrNull(args, "srcFile"));
-    assert(src_file);
+    const auto* arguments = std::get_if<flutter::EncodableMap>(method_call.arguments());
+    
+    // 解析参数，注意类型安全
+    std::string srcFile = std::get<std::string>(arguments->at(flutter::EncodableValue("srcFile")));
+    std::string destFile = std::get<std::string>(arguments->at(flutter::EncodableValue("destFile")));
+    int width = std::get<int>(arguments->at(flutter::EncodableValue("width")));
+    int height = std::get<int>(arguments->at(flutter::EncodableValue("height")));
+    
+    // 正确转换 UTF-8 路径到宽字符
+    std::wstring wSrcFile = Utf8ToWide(srcFile);
+    std::wstring wDestFile = Utf8ToWide(destFile);
 
-    const auto* dest_file =
-        std::get_if<std::string>(ValueOrNull(args, "destFile"));
-    assert(dest_file);
-
-    // NOTE: `width` is used as thumbnail size.
-    const auto* width =
-        std::get_if<int>(ValueOrNull(args, "width"));
-    assert(width);
-
-    const auto* outType =
-        std::get_if<std::string>(ValueOrNull(args, "format"));
-    assert(outType);
-
-    auto oper_res = SaveThumbnail(Utf16FromUtf8(*src_file).c_str(), Utf16FromUtf8(*dest_file).c_str(), *width, outType->compare("png") == 0 ? Gdiplus::ImageFormatPNG : Gdiplus::ImageFormatJPEG);
-
-    if (oper_res == kGetThumbnailFailedExtraction) {
-      result->Success(flutter::EncodableValue(false));
-    } else if (oper_res != "") {
-      result->Error("PluginError", "Operation failed. " + oper_res);
-    } else {
-      result->Success(flutter::EncodableValue(true));
+    try {
+        // 1. 打开文件
+        auto file = StorageFile::GetFileFromPathAsync(wSrcFile).get();
+        
+        // 2. 确定请求尺寸
+        uint32_t requestedSize = static_cast<uint32_t>(max(width, height));
+        
+        // 3. 提取缩略图 (VideosView 模式)
+        // 这一步会利用系统索引或实时解码，在沙盒内是合法的
+        auto thumbnail = file.GetThumbnailAsync(ThumbnailMode::VideosView, requestedSize).get();
+        
+        if (thumbnail) {
+            auto size = thumbnail.Size();
+            Buffer buffer(size);
+            thumbnail.ReadAsync(buffer, size, InputStreamOptions::None).get();
+            
+            // 4. 写入目标文件
+            SaveBufferToFile(buffer, wDestFile);
+            
+            result->Success(flutter::EncodableValue(true));
+        } else {
+            result->Error("FAILED", "WinRT returned null thumbnail");
+        }
+    } catch (const winrt::hresult_error& ex) {
+        // HRESULT 错误捕获（如：文件不存在或格式不支持）
+        std::string msg = "WinRT Error: " + std::to_string(ex.code());
+        result->Error("WINRT_ERROR", msg);
+    } catch (...) {
+        result->Error("UNKNOWN_ERROR", "Failed to process video thumbnail");
     }
+    
   } else {
     result->NotImplemented();
   }
