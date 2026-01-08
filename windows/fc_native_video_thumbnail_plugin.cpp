@@ -91,65 +91,65 @@ void FcNativeVideoThumbnailPlugin::HandleMethodCall(
         int w = std::get<int>(args->at(flutter::EncodableValue("width")));
         int h = std::get<int>(args->at(flutter::EncodableValue("height")));
 
-        WriteLog("--- 新请求 ---");
-        WriteLog("源文件: " + src);
-        WriteLog("目标文件: " + dest);
+        WriteLog("--- New request ---");
+        WriteLog("Source file: " + src);
+        WriteLog("Destination file: " + dest);
 
         // 使用 shared_ptr 包装 result 以便在 Lambda 线程中安全传递
         std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> shared_result = std::move(result);
 
         std::thread([src, dest, w, h, shared_result]() {
-            std::string step = "准备开始";
+            std::string step = "Preparing";
             try {
-                // 1. 初始化 COM MTA 环境
-                step = "初始化 COM MTA";
+                // 1. Initialize COM MTA
+                step = "Initialize COM MTA";
                 winrt::init_apartment(winrt::apartment_type::multi_threaded);
-                WriteLog("成功: " + step);
+                WriteLog("Success: " + step);
 
-                // 2. 获取文件对象
-                step = "获取文件对象: " + src;
+                // 2. Get file object
+                step = "Get file object: " + src;
                 auto file = StorageFile::GetFileFromPathAsync(Utf8ToWide(src)).get();
-                WriteLog("成功: 已找到文件");
+                WriteLog("Success: Found file");
 
-                // 3. 提取缩略图
-                step = "提取缩略图 (WinRT GetThumbnailAsync)";
+                // 3. Extract thumbnail
+                step = "Extract thumbnail (WinRT GetThumbnailAsync)";
                 uint32_t size = static_cast<uint32_t>((w > h) ? w : h);
                 auto thumb = file.GetThumbnailAsync(ThumbnailMode::VideosView, size).get();
                 
                 if (thumb) {
-                    WriteLog("成功: 缩略图生成完毕, 大小: " + std::to_string(thumb.Size()));
+                    WriteLog("Success: Thumbnail generated, size: " + std::to_string(thumb.Size()));
 
-                    // 4. 将数据读入内存 Buffer
-                    step = "读取缩略图数据流";
+                    // 4. Read thumbnail data stream
+                    step = "Read thumbnail data stream";
                     uint32_t tSize = static_cast<uint32_t>(thumb.Size());
                     Buffer buffer(tSize);
                     thumb.ReadAsync(buffer, tSize, InputStreamOptions::None).get();
 
-                    // 5. 写入目标磁盘路径
-                    step = "写入目标文件: " + dest;
+                    // 5. Write to target disk path
+                    step = "Write target file: " + dest;
                     std::ofstream ofs(Utf8ToWide(dest), std::ios::binary);
                     if (ofs.is_open()) {
                         ofs.write(reinterpret_cast<const char*>(buffer.data()), buffer.Length());
                         ofs.close();
-                        WriteLog("成功: 任务圆满完成");
+                        WriteLog("Success: Task completed successfully");
                         shared_result->Success(flutter::EncodableValue(true));
                     } else {
-                        WriteLog("失败: 目标路径无法写入 (权限或路径不存在)");
+                        WriteLog("Failure: Cannot write to destination path (permission or path missing)");
                         shared_result->Error("IO_ERROR", "Cannot open dest for writing");
                     }
                 } else {
-                    WriteLog("失败: WinRT 返回了空的缩略图");
+                    WriteLog("Failure: WinRT returned a null thumbnail");
                     shared_result->Error("NULL_THUMB", "WinRT returned null");
                 }
             } catch (const winrt::hresult_error& e) {
                 std::string errCode = std::to_string(e.code());
-                WriteLog("WinRT 异常 [" + step + "]: HRESULT " + errCode);
+                WriteLog("WinRT exception [" + step + "]: HRESULT " + errCode);
                 shared_result->Error("WINRT_ERR", "At step: " + step + ", Code: " + errCode);
             } catch (const std::exception& e) {
-                WriteLog("标准异常: " + std::string(e.what()));
+                WriteLog("Std exception: " + std::string(e.what()));
                 shared_result->Error("STD_ERR", e.what());
             } catch (...) {
-                WriteLog("未知错误在步骤: " + step);
+                WriteLog("Unknown error at step: " + step);
                 shared_result->Error("UNKNOWN_ERR", "Error at: " + step);
             }
         }).detach();
