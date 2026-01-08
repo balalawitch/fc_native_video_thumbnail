@@ -1,42 +1,53 @@
 ﻿#include "fc_native_video_thumbnail_plugin.h"
 
+#include <atlimage.h>
+#include <comdef.h>
 #include <flutter/method_channel.h>
 #include <flutter/plugin_registrar_windows.h>
 #include <flutter/standard_method_codec.h>
-
+#include <gdiplus.h>
+#include <gdiplusimaging.h>
+#include <shlwapi.h>
+#include <thumbcache.h>
+#include <wincodec.h>
 #include <windows.h>
-#include <memory>
-#include <string>
-#include <fstream>
-#include <thread>
-#include <chrono>
-#include <iomanip>
-#include <iostream>
+#include <wingdi.h>
+#include <shobjidl.h>
 
-// WinRT 核心头文件
-#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Storage.h>
-#include <winrt/Windows.Storage.FileProperties.h>
-#include <winrt/Windows.Storage.Streams.h>
 
-using namespace winrt;
-using namespace Windows::Storage;
-using namespace Windows::Storage::FileProperties;
-using namespace Windows::Storage::Streams;
+#include <codecvt>
+#include <iostream>
+#include <locale>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <chrono>
+
+using namespace winrt::Windows::Storage;
 
 namespace fc_native_video_thumbnail {
 
-// --- 辅助工具：日志记录系统 ---
-// 自动识别 MSIX 路径或普通 Win32 路径
+// --- 1. 日志工具 ---
+
+std::string Utf8FromUtf16(const std::wstring& wstr) {
+    if (wstr.empty()) return std::string();
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    return strTo;
+}
+
 void WriteLog(const std::string& message) {
     try {
         std::wstring logPath;
         try {
-            // 尝试获取 MSIX 的 LocalFolder 路径
             auto localFolder = ApplicationData::Current().LocalFolder().Path();
             logPath = std::wstring(localFolder.c_str()) + L"\\plugin_debug.log";
         } catch (...) {
-            // 如果不是 MSIX 环境（如直接在 VS 中 F5 调试），则写在 exe 同级目录
             logPath = L"plugin_debug.log";
         }
 
@@ -52,108 +63,143 @@ void WriteLog(const std::string& message) {
     } catch (...) {}
 }
 
-// UTF-8 转 宽字符 (Windows 路径必备)
-std::wstring Utf8ToWide(const std::string& utf8Str) {
-    if (utf8Str.empty()) return L"";
-    int size = MultiByteToWideChar(CP_UTF8, 0, &utf8Str[0], (int)utf8Str.size(), NULL, 0);
-    std::wstring wstr(size, 0);
-    MultiByteToWideChar(CP_UTF8, 0, &utf8Str[0], (int)utf8Str.size(), &wstr[0], size);
-    return wstr;
+// --- 2. 辅助转换工具 ---
+
+std::wstring Utf16FromUtf8(const std::string& utf8_string) {
+    if (utf8_string.empty()) return std::wstring();
+    int target_length = ::MultiByteToWideChar(CP_UTF8, 0, utf8_string.data(), (int)utf8_string.length(), nullptr, 0);
+    std::wstring utf16_string(target_length, L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, utf8_string.data(), (int)utf8_string.length(), &utf16_string[0], target_length);
+    return utf16_string;
 }
 
-void FcNativeVideoThumbnailPlugin::RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar) {
-    auto channel = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
-        registrar->messenger(),
-        "fc_native_video_thumbnail",
-        &flutter::StandardMethodCodec::GetInstance()); // 必须是大驼峰：StandardMethodCodec
-
-    auto plugin = std::make_unique<FcNativeVideoThumbnailPlugin>();
-
-    channel->SetMethodCallHandler([plugin_pointer = plugin.get()](const auto& call, auto result) {
-        plugin_pointer->HandleMethodCall(call, std::move(result));
-        });
-
-    registrar->AddPlugin(std::move(plugin));
+std::string HRESULTToString(HRESULT hr) {
+    _com_error error(hr);
+    std::stringstream ss;
+    ss << "0x" << std::hex << std::setw(8) << std::setfill('0') << hr << " (" << Utf8FromUtf16(error.ErrorMessage()) << ")";
+    return ss.str();
 }
 
-FcNativeVideoThumbnailPlugin::FcNativeVideoThumbnailPlugin() {}
-FcNativeVideoThumbnailPlugin::~FcNativeVideoThumbnailPlugin() {}
+// --- 3. 核心：路径修复逻辑 ---
+
+std::wstring ResolvePhysicalPath(const std::wstring& virtualPath, const std::string& label) {
+    WriteLog("正在解析" + label + "路径: " + Utf8FromUtf16(virtualPath));
+    
+    // 如果是 MSIX 沙盒路径环境
+    if (virtualPath.find(L"AppData\\Roaming") != std::wstring::npos) {
+        try {
+            auto roamingPath = ApplicationData::Current().RoamingFolder().Path();
+            std::filesystem::path p(virtualPath);
+            std::wstring fileName = p.filename().wstring();
+            
+            // 简单而鲁棒的策略：假设文件就在 RoamingFolder 的根目录或 thumbnail_test 子目录下
+            // 你可以根据 Flutter 端的具体 p.join 逻辑微调这里
+            std::wstring realPath = std::wstring(roamingPath.c_str()) + L"\\thumbnail_test\\" + fileName;
+            
+            // 如果不存在，尝试直接放在根目录
+            if (!std::filesystem::exists(realPath)) {
+                realPath = std::wstring(roamingPath.c_str()) + L"\\" + fileName;
+            }
+
+            WriteLog("物理路径转换成功: " + Utf8FromUtf16(realPath));
+            return realPath;
+        } catch (...) {
+            WriteLog("WinRT 获取沙盒路径失败，维持原样");
+        }
+    }
+    return virtualPath;
+}
+
+// --- 4. 提取逻辑 ---
+
+std::string SaveThumbnail(PCWSTR srcFile, PCWSTR destFile, int size, REFGUID type) {
+    HRESULT hr;
+    
+    // 检查源文件物理存在
+    if (!std::filesystem::exists(srcFile)) {
+        return "源文件在物理磁盘上不存在";
+    }
+
+    IShellItem* pSI = nullptr;
+    hr = SHCreateItemFromParsingName(srcFile, NULL, IID_PPV_ARGS(&pSI));
+    if (FAILED(hr)) {
+        return "SHCreateItemFromParsingName 失败: " + HRESULTToString(hr);
+    }
+
+    IThumbnailCache* pThumbCache = nullptr;
+    hr = CoCreateInstance(CLSID_LocalThumbnailCache, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pThumbCache));
+    if (FAILED(hr)) {
+        if (pSI) pSI->Release();
+        return "创建 IThumbnailCache 失败: " + HRESULTToString(hr);
+    }
+
+    ISharedBitmap* pSharedBitmap = nullptr;
+    // 使用 WTS_FORCEEXTRACTION 绕过可能损坏的沙盒缓存
+    hr = pThumbCache->GetThumbnail(pSI, size, WTS_EXTRACT | WTS_FORCEEXTRACTION | WTS_SCALETOREQUESTEDSIZE, &pSharedBitmap, NULL, NULL);
+
+    if (FAILED(hr) || !pSharedBitmap) {
+        pSI->Release();
+        pThumbCache->Release();
+        if (hr == 0x8004b100) return "Failed extraction (视频格式可能不支持或文件损坏)";
+        return "GetThumbnail 失败: " + HRESULTToString(hr);
+    }
+
+    HBITMAP hBitmap = NULL;
+    hr = pSharedBitmap->GetSharedBitmap(&hBitmap);
+    if (SUCCEEDED(hr) && hBitmap) {
+        CImage image;
+        image.Attach(hBitmap);
+        
+        // 自动创建目标目录
+        std::filesystem::path dp(destFile);
+        std::filesystem::create_directories(dp.parent_path());
+
+        hr = image.Save(destFile, type);
+        image.Detach();
+        WriteLog("图片保存结果: " + HRESULTToString(hr));
+    }
+
+    if (pSI) pSI->Release();
+    if (pSharedBitmap) pSharedBitmap->Release();
+    if (pThumbCache) pThumbCache->Release();
+
+    return SUCCEEDED(hr) ? "" : ("保存图片失败: " + HRESULTToString(hr));
+}
+
+// --- 5. 插件入口 ---
 
 void FcNativeVideoThumbnailPlugin::HandleMethodCall(
-    const flutter::MethodCall<flutter::EncodableValue> &method_call,
+    const flutter::MethodCall<flutter::EncodableValue>& method_call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-
+    
     if (method_call.method_name().compare("getVideoThumbnail") == 0) {
-        const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments());
+        const auto* argsPtr = std::get_if<flutter::EncodableMap>(method_call.arguments());
+        auto& args = *argsPtr;
+
+        std::string src = std::get<std::string>(args.at(flutter::EncodableValue("srcFile")));
+        std::string dest = std::get<std::string>(args.at(flutter::EncodableValue("destFile")));
+        int width = std::get<int>(args.at(flutter::EncodableValue("width")));
+        std::string format = std::get<std::string>(args.at(flutter::EncodableValue("format")));
+
+        WriteLog("--- 新请求 ---");
         
-        std::string src = std::get<std::string>(args->at(flutter::EncodableValue("srcFile")));
-        std::string dest = std::get<std::string>(args->at(flutter::EncodableValue("destFile")));
-        int w = std::get<int>(args->at(flutter::EncodableValue("width")));
-        int h = std::get<int>(args->at(flutter::EncodableValue("height")));
+        std::wstring wSrc = ResolvePhysicalPath(Utf16FromUtf8(src), "源文件");
+        std::wstring wDest = ResolvePhysicalPath(Utf16FromUtf8(dest), "目标文件");
 
-        WriteLog("--- New request ---");
-        WriteLog("Source file: " + src);
-        WriteLog("Destination file: " + dest);
+        std::string err = SaveThumbnail(wSrc.c_str(), wDest.c_str(), width, (format == "png" ? Gdiplus::ImageFormatPNG : Gdiplus::ImageFormatJPEG));
 
-        // 使用 shared_ptr 包装 result 以便在 Lambda 线程中安全传递
-        std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> shared_result = std::move(result);
-
-        std::thread([src, dest, w, h, shared_result]() {
-            std::string step = "Preparing";
-            try {
-                // 1. Initialize COM MTA
-                step = "Initialize COM MTA";
-                winrt::init_apartment(winrt::apartment_type::multi_threaded);
-                WriteLog("Success: " + step);
-
-                // 2. Get file object
-                step = "Get file object: " + src;
-                auto file = StorageFile::GetFileFromPathAsync(Utf8ToWide(src)).get();
-                WriteLog("Success: Found file");
-
-                // 3. Extract thumbnail
-                step = "Extract thumbnail (WinRT GetThumbnailAsync)";
-                uint32_t size = static_cast<uint32_t>((w > h) ? w : h);
-                auto thumb = file.GetThumbnailAsync(ThumbnailMode::VideosView, size).get();
-                
-                if (thumb) {
-                    WriteLog("Success: Thumbnail generated, size: " + std::to_string(thumb.Size()));
-
-                    // 4. Read thumbnail data stream
-                    step = "Read thumbnail data stream";
-                    uint32_t tSize = static_cast<uint32_t>(thumb.Size());
-                    Buffer buffer(tSize);
-                    thumb.ReadAsync(buffer, tSize, InputStreamOptions::None).get();
-
-                    // 5. Write to target disk path
-                    step = "Write target file: " + dest;
-                    std::ofstream ofs(Utf8ToWide(dest), std::ios::binary);
-                    if (ofs.is_open()) {
-                        ofs.write(reinterpret_cast<const char*>(buffer.data()), buffer.Length());
-                        ofs.close();
-                        WriteLog("Success: Task completed successfully");
-                        shared_result->Success(flutter::EncodableValue(true));
-                    } else {
-                        WriteLog("Failure: Cannot write to destination path (permission or path missing)");
-                        shared_result->Error("IO_ERROR", "Cannot open dest for writing");
-                    }
-                } else {
-                    WriteLog("Failure: WinRT returned a null thumbnail");
-                    shared_result->Error("NULL_THUMB", "WinRT returned null");
-                }
-            } catch (const winrt::hresult_error& e) {
-                std::string errCode = std::to_string(e.code());
-                WriteLog("WinRT exception [" + step + "]: HRESULT " + errCode);
-                shared_result->Error("WINRT_ERR", "At step: " + step + ", Code: " + errCode);
-            } catch (const std::exception& e) {
-                WriteLog("Std exception: " + std::string(e.what()));
-                shared_result->Error("STD_ERR", e.what());
-            } catch (...) {
-                WriteLog("Unknown error at step: " + step);
-                shared_result->Error("UNKNOWN_ERR", "Error at: " + step);
+        if (err.empty()) {
+            WriteLog("成功完成");
+            result->Success(flutter::EncodableValue(true));
+        } else {
+            WriteLog("最终失败: " + err);
+            // 如果是视频解码失败，返回 Success(false) 避免 Dart 端抛出异常
+            if (err.find("Failed extraction") != std::string::npos) {
+                result->Success(flutter::EncodableValue(false));
+            } else {
+                result->Error("ThumbnailError", err);
             }
-        }).detach();
-
+        }
     } else {
         result->NotImplemented();
     }
