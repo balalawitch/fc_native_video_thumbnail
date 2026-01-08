@@ -22,6 +22,8 @@
 #include <chrono>
 #include <sstream>
 #include <string>
+#include <algorithm>
+#include <cwctype>
 
 using namespace winrt::Windows::Storage;
 namespace fs = std::filesystem;
@@ -101,6 +103,16 @@ namespace fc_native_video_thumbnail {
         return path;
     }
 
+    // 大小写不敏感查找子字符串
+    size_t FindCaseInsensitive(const std::wstring& haystack, const std::wstring& needle) {
+        auto it = std::search(
+                haystack.begin(), haystack.end(),
+                needle.begin(), needle.end(),
+                [](wchar_t ch1, wchar_t ch2) { return ::towupper(ch1) == ::towupper(ch2); }
+        );
+        return (it == haystack.end()) ? std::wstring::npos : std::distance(haystack.begin(), it);
+    }
+
     // --- 3. 核心路径解析逻辑 (组合策略) ---
 
     std::wstring ResolvePhysicalPathForSource(const std::wstring& virtualPath) {
@@ -116,11 +128,12 @@ namespace fc_native_video_thumbnail {
 
         // 策略2: 尝试MSIX沙盒虚拟路径映射（包含 \AppData\Roaming\ 或 \AppData\Local\）
         // 必须在直接路径检查之前，因为MSIX环境下fs::exists可能返回true但Shell API不支持虚拟路径
+        // 使用大小写不敏感查找，因为Windows路径可能是小写的
         try {
             std::wstring keyRoaming = L"\\AppData\\Roaming\\";
             std::wstring keyLocal = L"\\AppData\\Local\\";
-            size_t posRoaming = virtualPath.find(keyRoaming);
-            size_t posLocal = virtualPath.find(keyLocal);
+            size_t posRoaming = FindCaseInsensitive(virtualPath, keyRoaming);
+            size_t posLocal = FindCaseInsensitive(virtualPath, keyLocal);
 
             if (posRoaming != std::wstring::npos) {
                 WriteLog("[INFO] Path contains \\AppData\\Roaming\\, trying MSIX sandbox mapping");
@@ -201,8 +214,9 @@ namespace fc_native_video_thumbnail {
             std::wstring roamingKey = L"\\AppData\\Roaming\\";
             std::wstring localKey = L"\\AppData\\Local\\";
 
-            size_t roamingPos = virtualPath.find(roamingKey);
-            size_t localPos = virtualPath.find(localKey);
+            // 使用大小写不敏感查找
+            size_t roamingPos = FindCaseInsensitive(virtualPath, roamingKey);
+            size_t localPos = FindCaseInsensitive(virtualPath, localKey);
 
             if (roamingPos != std::wstring::npos) {
                 // 处理 Roaming -> RoamingState 或 LocalCache\Roaming
